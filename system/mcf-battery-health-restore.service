@@ -1,0 +1,10 @@
+[Unit]
+Description=MCF Battery Health — re-apply the chosen charging mode
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/mcf-battery-health/helper restore
+
+[Install]
+WantedBy=multi-user.target

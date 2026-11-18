@@ -1,0 +1,218 @@
+#!/bin/bash
+# MCF Battery Health — root helper.
+#
+# The only part of MCF Battery Health that writes battery settings. It accepts
+# a fixed set of verbs, never takes paths or numbers from the caller, and only
+# writes the charge-control files of the first battery that has them.
+#
+#   limit        hold the battery at 75–80% (recommended for docked use)
+#   full         charge to 100% (travel days)
+#   bypass       don't charge at all; run on dock/charger power
+#   drain        run off the battery down to 80%, then switch to limit
+#   drain-check  timer tick for drain (internal)
+#   restore      re-apply the chosen mode (boot + charger events, internal)
+
+set -uo pipefail
+export PATH=/usr/bin:/bin
+
+SYSFS=/sys/class/power_supply
+STATE_DIR=/var/lib/mcf-battery-health
+# Test-only overrides; ignored for root, and sudo strips the environment anyway.
+if [[ $EUID -ne 0 ]]; then
+  SYSFS=${MCF_BH_SYSFS:-$SYSFS}
+  STATE_DIR=${MCF_BH_STATE:-$STATE_DIR}
+fi
+STATE="$STATE_DIR/state"
+DRAIN_UNIT=mcf-battery-health-drain
+
+LIMIT_START=75 LIMIT_END=80
+FULL_START=95  FULL_END=100
+
+log() { logger -t mcf-battery-health -- "$*" 2>/dev/null || true; }
+die() { echo "mcf-battery-health: $*" >&2; exit 1; }
+
+battery() {
+  local b
+  for b in "$SYSFS"/BAT*; do
+    [[ -f $b/charge_control_end_threshold ]] && { echo "$b"; return 0; }
+  done
+  return 1
+}
+
+on_ac() {
+  local s
+  for s in "$SYSFS"/*; do
+    [[ -f $s/type && $(<"$s/type") == Mains && -f $s/online ]] || continue
+    [[ $(<"$s/online") == 1 ]] && return 0
+  done
+  return 1
+}
+
+read_state() {
+  MODE=limit HEALED=""
+  [[ -f $STATE ]] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case $k in
+      mode) [[ $v =~ ^(limit|full|bypass|drain)$ ]] && MODE=$v ;;
+      healed) [[ $v =~ ^[0-9T:+-]+$ ]] && HEALED=$v ;;
+    esac
+  done <"$STATE"
+}
+
+write_state() {
+  mkdir -p "$STATE_DIR" && chmod 755 "$STATE_DIR"
+  printf 'mode=%s\nhealed=%s\n' "$MODE" "$HEALED" >"$STATE.tmp" &&
+    chmod 644 "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+}
+
+# start must stay below end at every step or the kernel rejects the write,
+# so lower the start first when going down and raise the end first going up.
+set_thresholds() {
+  local bat=$1 start=$2 end=$3 cur_end
+  [[ -f $bat/charge_control_start_threshold ]] || {
+    echo "$end" >"$bat/charge_control_end_threshold"; return
+  }
+  cur_end=$(<"$bat/charge_control_end_threshold")
+  if (( start < cur_end )); then
+    echo "$start" >"$bat/charge_control_start_threshold" &&
+      echo "$end" >"$bat/charge_control_end_threshold"
+  else
+    echo "$end" >"$bat/charge_control_end_threshold" &&
+      echo "$start" >"$bat/charge_control_start_threshold"
+  fi
+}
+
+thresholds_are() {
+  local bat=$1 start=$2 end=$3
+  [[ $(<"$bat/charge_control_end_threshold") == "$end" ]] || return 1
+  [[ ! -f $bat/charge_control_start_threshold ]] && return 0
+  [[ $(<"$bat/charge_control_start_threshold") == "$start" ]]
+}
+
+# charge_behaviour lists the options with the active one in [brackets].
+behaviour() {
+  local bat=$1
+  [[ -f $bat/charge_behaviour ]] || { echo auto; return; }
+  sed -n 's/.*\[\([a-z-]*\)\].*/\1/p' "$bat/charge_behaviour"
+}
+
+supports_behaviour() {
+  local bat=$1 want=$2
+  [[ -f $bat/charge_behaviour ]] && grep -qw -- "$want" "$bat/charge_behaviour"
+}
+
+set_behaviour() {
+  local bat=$1 want=$2
+  supports_behaviour "$bat" "$want" || return 1
+  [[ $(behaviour "$bat") == "$want" ]] && return 0
+  echo "$want" >"$bat/charge_behaviour"
+}
+
+drain_timer_active() {
+  systemctl is-active --quiet "$DRAIN_UNIT.timer" 2>/dev/null
+}
+
+stop_drain_timer() {
+  systemctl stop --no-block "$DRAIN_UNIT.timer" 2>/dev/null || true
+}
+
+apply_limit() {
+  local bat=$1
+  thresholds_are "$bat" $LIMIT_START $LIMIT_END ||
+    set_thresholds "$bat" $LIMIT_START $LIMIT_END || die "could not set 75–80% limit"
+  set_behaviour "$bat" auto || true
+}
+
+capacity() { cat "$1/capacity" 2>/dev/null || echo 0; }
+
+BAT=$(battery) || die "no battery with charge-control support found"
+read_state
+
+case "${1-}" in
+  limit)
+    stop_drain_timer
+    apply_limit "$BAT"
+    MODE=limit; write_state
+    ;;
+
+  full)
+    stop_drain_timer
+    thresholds_are "$BAT" $FULL_START $FULL_END ||
+      set_thresholds "$BAT" $FULL_START $FULL_END || die "could not set full charge"
+    set_behaviour "$BAT" auto || true
+    MODE=full; write_state
+    ;;
+
+  bypass)
+    supports_behaviour "$BAT" inhibit-charge || die "this battery doesn't support bypass (inhibit-charge)"
+    stop_drain_timer
+    # Keep the 80% cap underneath, so if the firmware drops inhibit-charge
+    # the battery still never goes past 80%.
+    apply_limit "$BAT"
+    if on_ac; then set_behaviour "$BAT" inhibit-charge || die "could not enable bypass"; fi
+    MODE=bypass; write_state
+    ;;
+
+  drain)
+    apply_limit "$BAT"
+    MODE=limit
+    if on_ac && (( $(capacity "$BAT") > LIMIT_END )); then
+      supports_behaviour "$BAT" force-discharge || { write_state; die "this battery can't force-discharge"; }
+      set_behaviour "$BAT" force-discharge || { write_state; die "could not start draining"; }
+      MODE=drain
+      stop_drain_timer
+      systemctl reset-failed "$DRAIN_UNIT.timer" "$DRAIN_UNIT.service" 2>/dev/null || true
+      systemd-run --quiet --unit="$DRAIN_UNIT" --on-active=30s --on-unit-active=30s \
+        --timer-property=AccuracySec=5s \
+        /usr/local/libexec/mcf-battery-health/helper drain-check ||
+        { set_behaviour "$BAT" auto; MODE=limit; write_state; die "could not start the drain timer"; }
+    fi
+    write_state
+    ;;
+
+  drain-check)
+    # Finish when we hit 80%, the charger is unplugged, or something else
+    # (firmware, replug) already switched the battery out of force-discharge.
+    if [[ $MODE != drain ]] || ! on_ac || (( $(capacity "$BAT") <= LIMIT_END )) ||
+       [[ $(behaviour "$BAT") != force-discharge ]]; then
+      apply_limit "$BAT"
+      [[ $MODE == drain ]] && { MODE=limit; write_state; }
+      stop_drain_timer
+      log "drain finished at $(capacity "$BAT")%, holding 75–80%"
+    fi
+    ;;
+
+  restore)
+    case $MODE in
+      limit)
+        if ! thresholds_are "$BAT" $LIMIT_START $LIMIT_END; then
+          log "limit was reset (end=$(<"$BAT/charge_control_end_threshold")%), restoring 75–80%"
+          HEALED=$(date -Iseconds)
+          apply_limit "$BAT"
+          write_state
+        fi
+        [[ $(behaviour "$BAT") == auto ]] || set_behaviour "$BAT" auto || true
+        ;;
+      full)
+        thresholds_are "$BAT" $FULL_START $FULL_END || set_thresholds "$BAT" $FULL_START $FULL_END
+        ;;
+      bypass)
+        thresholds_are "$BAT" $LIMIT_START $LIMIT_END || { HEALED=$(date -Iseconds); apply_limit "$BAT"; write_state; }
+        if on_ac; then set_behaviour "$BAT" inhibit-charge || true; fi
+        ;;
+      drain)
+        # A drain can't survive a reboot or an unplug; fall back to the limit.
+        drain_timer_active && [[ $(behaviour "$BAT") == force-discharge ]] && on_ac && exit 0
+        stop_drain_timer
+        apply_limit "$BAT"
+        MODE=limit; write_state
+        ;;
+    esac
+    ;;
+
+  *)
+    echo "usage: helper limit|full|bypass|drain|restore" >&2
+    exit 2
+    ;;
+esac

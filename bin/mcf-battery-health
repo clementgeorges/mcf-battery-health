@@ -1,0 +1,136 @@
+#!/bin/bash
+# MCF Battery Health — pick a charging mode from an Omarchy popup menu.
+# Opens, applies your choice, closes. Nothing keeps running afterwards.
+
+set -uo pipefail
+
+HELPER=/usr/local/libexec/mcf-battery-health/helper
+SYSFS=${MCF_BH_SYSFS:-/sys/class/power_supply}
+STATE=${MCF_BH_STATE:-/var/lib/mcf-battery-health}/state
+TITLE="Battery Health"
+
+notify() { # glyph headline [description]
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send -g "$1" "$2" "${3-}" >/dev/null 2>&1 &
+  elif command -v notify-send >/dev/null; then
+    notify-send "$2" "${3-}" &
+  else
+    echo "$2${3:+ — $3}"
+  fi
+}
+
+battery() {
+  local b
+  for b in "$SYSFS"/BAT*; do
+    [[ -f $b/charge_control_end_threshold ]] && { echo "$b"; return 0; }
+  done
+  return 1
+}
+
+BAT=$(battery) || { notify 󰂃 "$TITLE" "This laptop's battery doesn't support charge limits."; exit 1; }
+[[ -x $HELPER ]] || { notify 󰂃 "$TITLE" "Not installed yet — run install.sh."; exit 1; }
+
+read_file() { cat "$1" 2>/dev/null || echo "${2-}"; }
+
+mode=limit healed=""
+if [[ -f $STATE ]]; then
+  while IFS='=' read -r k v; do
+    case $k in mode) mode=$v ;; healed) healed=$v ;; esac
+  done <"$STATE"
+fi
+
+pct=$(read_file "$BAT/capacity" "?")
+status=$(read_file "$BAT/status" "Unknown")
+start=$(read_file "$BAT/charge_control_start_threshold" "")
+end=$(read_file "$BAT/charge_control_end_threshold" "?")
+behaviour=$(sed -n 's/.*\[\([a-z-]*\)\].*/\1/p' "$BAT/charge_behaviour" 2>/dev/null)
+behaviour=${behaviour:-auto}
+
+ac="on battery"
+for s in "$SYSFS"/*; do
+  [[ -f $s/type && $(<"$s/type") == Mains && $(read_file "$s/online" 0) == 1 ]] && ac="on AC"
+done
+
+health=""
+full=$(read_file "$BAT/energy_full" "") design=$(read_file "$BAT/energy_full_design" "")
+[[ -n $full && -n $design && $design -gt 0 ]] && health="$(( full * 100 / design ))% health"
+cycles=$(read_file "$BAT/cycle_count" "")
+[[ -n $cycles && $cycles != 0 ]] && health="${health:+$health · }$cycles cycles"
+
+case $mode in
+  limit)  mode_label="Limited to 80%" ;;
+  full)   mode_label="Full charge" ;;
+  bypass) mode_label="Bypass — not charging" ;;
+  drain)  mode_label="Draining to 80%" ;;
+  *)      mode_label="Unknown" ;;
+esac
+
+# Flag a limit that's not what was chosen (e.g. a BIOS update reset it).
+warning=""
+if [[ $mode == limit || $mode == bypass ]] && [[ $end != 80 ]]; then
+  warning="Limit is at ${end}% — pick Limit to 80% to fix it"
+fi
+
+# Omarchy's own menus mark the current choice with a trailing ✓.
+mark() { [[ $mode == "$1" ]] && echo " ✓"; }
+
+rows=(
+  "󰋽	Status: ${pct}% · ${mode_label}	${warning:-${start:+$start–}${end}% thresholds · ${ac}${health:+ · $health}}"
+  "󰂀	Limit to 80%$(mark limit)	Holds 75–80% — best for all-day docking"
+  "󰁹	Full charge$(mark full)	Charges to 100% for a day away from the desk"
+)
+grep -qw inhibit-charge "$BAT/charge_behaviour" 2>/dev/null &&
+  rows+=("󰚥	Bypass$(mark bypass)	Runs on dock power, battery isn't charged")
+grep -qw force-discharge "$BAT/charge_behaviour" 2>/dev/null &&
+  rows+=("󰂌	Drain to 80%$(mark drain)	Uses the battery while docked, then limits at 80%")
+
+pick() {
+  if command -v omarchy-menu-select >/dev/null; then
+    omarchy-menu-select "$TITLE" "${rows[@]}" -- --width 600
+  elif command -v walker >/dev/null; then
+    printf '%s\n' "${rows[@]}" | sed 's/^[^\t]*\t//' | walker --dmenu -p "$TITLE"
+  else
+    notify 󰂃 "$TITLE" "No menu picker found (omarchy-menu-select or walker)."
+    return 1
+  fi
+}
+
+choice=$(pick) || exit 0
+choice=${choice%%$'\t'*}
+choice=${choice% ✓}
+
+run() { sudo -n "$HELPER" "$1" 2>&1; }
+
+case $choice in
+  Status:*)
+    details="${pct}% · ${status} · ${ac}
+Thresholds ${start:+$start–}${end}% · charging: ${behaviour}${health:+
+$health}"
+    [[ -n $healed ]] && details+="
+Last auto-fix: ${healed%%T*}"
+    notify 󰋽 "$mode_label" "$details"
+    ;;
+  "Limit to 80%")
+    out=$(run limit) && notify 󰂀 "Limited to 80%" "The battery will hold between 75% and 80%." ||
+      notify 󰂃 "Couldn't set the limit" "$out"
+    ;;
+  "Full charge")
+    out=$(run full) && notify 󰁹 "Charging to 100%" "Pick Limit to 80% again when you're back at the desk." ||
+      notify 󰂃 "Couldn't switch to full charge" "$out"
+    ;;
+  Bypass)
+    out=$(run bypass) && notify 󰚥 "Bypass on" "Running on dock power; the battery stays where it is." ||
+      notify 󰂃 "Couldn't turn on bypass" "$out"
+    ;;
+  "Drain to 80%")
+    if out=$(run drain); then
+      if [[ $ac == "on AC" && $pct =~ ^[0-9]+$ && $pct -gt 80 ]]; then
+        notify 󰂌 "Draining to 80%" "Running on battery while docked. The limit takes over at 80%."
+      else
+        notify 󰂀 "Limited to 80%" "Already at or below 80%, so there's nothing to drain."
+      fi
+    else
+      notify 󰂃 "Couldn't start draining" "$out"
+    fi
+    ;;
+esac

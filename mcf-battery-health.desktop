@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Battery Health
+GenericName=Battery charge limit
+Comment=Limit, bypass or drain battery charging
+Exec=@BIN@
+Icon=mcf-battery-health
+Terminal=false
+Categories=System;Settings;
+Keywords=battery;charge;charging;limit;power;health;bypass;drain;mcf;

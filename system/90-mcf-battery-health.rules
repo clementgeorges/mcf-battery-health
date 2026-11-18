@@ -1,0 +1,4 @@
+# MCF Battery Health: re-apply the chosen charging mode whenever the charger
+# or dock is plugged in or out, and when the battery appears at boot.
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block start mcf-battery-health-restore.service"
+SUBSYSTEM=="power_supply", ATTR{type}=="Battery", ACTION=="add", RUN+="/usr/bin/systemctl --no-block start mcf-battery-health-restore.service"
